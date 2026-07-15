@@ -98,14 +98,14 @@ DATASETS:
 Amounts are AED. Net = gross after VAT & fees. Use prior conversation to resolve references like "the same but for Caffellini".
 Respond ONLY with JSON, no prose, no markdown:
 {"queries":[{"id":"q1","dataset":"daily"|"items"|"hourly"|"menu_matrix","metric":"...","venue":"LF"|"Caffelini"|"all","from":"YYYY-MM-DD","to":"YYYY-MM-DD","groupBy":"...","category":"opt","item_contains":"opt","top":10,"label":"short series name"}]}
-Rules: to compare venues over time, one query per venue (same groupBy). Max 4 queries. Clamp dates to available range.`;
+Rules: to compare venues over time, one query per venue (same groupBy). If the question asks for SEVERAL metrics (e.g. guests AND avg per guest), emit a SEPARATE query per metric — "metric" must be exactly ONE value from the dataset's list. Max 4 queries. Clamp dates to available range.`;
 }
 
-const ANSWER_SYSTEM = `You are a sharp F&B financial analyst writing for a CFO. You receive a user question, optional prior conversation, and PRE-COMPUTED query results (computed by code — trust these numbers exactly, never recalculate or invent numbers).
+const ANSWER_SYSTEM = `You are a sharp F&B financial analyst writing for a CFO. You receive a user question, optional prior conversation, and PRE-COMPUTED query results (computed by code — trust these numbers exactly, never recalculate, never second-guess or invent numbers). Each result is labeled with its query (dataset, metric, venue, period) — the values ARE that metric.
 CURRENCY RULE (critical): ALL monetary values are UAE dirhams. NEVER use "$", "USD" or "dollars". Write amounts as "3.56M AED", "604.6K AED", "1,778 AED". Non-monetary metrics (guests, checks, qty) have no currency.
-Respond ONLY with JSON, no markdown fences:
+OUTPUT FORMAT (critical): your ENTIRE output must be a single JSON object. Start with "{" and end with "}". No preamble, no reasoning, no markdown, nothing outside the JSON.
 {"answer":"2-6 sentences, plain text, in the same language as the user question, cite the key numbers, be direct and note anything unusual","charts":[{"title":"...","type":"line"|"bar"|"area","queryIds":["q1"]}]}
-Charts: only when they add value; combine queries with the same groupBy; "bar" for weekday/venue/month/hour comparisons, "line"/"area" for date series. 0-2 charts. Do not chart menu_matrix results (visualized by code).`;
+Charts: only when they add value; combine queries with the same groupBy; "bar" for weekday/venue/month/hour/daypart comparisons, "line"/"area" for date series. 0-2 charts. Do not chart menu_matrix results (visualized by code).`;
 
 function fixCurrency(text) {
   if (!text) return text;
@@ -114,6 +114,34 @@ function fixCurrency(text) {
     .replace(/\bUSD\b/g, "AED")
     .replace(/\bdollars?\b/gi, "AED")
     .replace(/\bдоллар(ов|а|ы)?\b/gi, "AED");
+}
+
+/* Достаёт JSON, даже если модель обернула его текстом/fences */
+function extractJson(text) {
+  const clean = String(text || "").replace(/```json|```/g, "").trim();
+  try { return JSON.parse(clean); } catch {}
+  const a = clean.indexOf("{"), b = clean.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try { return JSON.parse(clean.slice(a, b + 1)); } catch {}
+  }
+  return null;
+}
+
+/* Нормализация метрики: синонимы -> словарь; невалидная -> первая валидная (никогда молча в gross) */
+function normalizeMetric(raw, dataset) {
+  const valid = dataset === "items" ? ITEM_METRICS
+    : dataset === "hourly" ? HOURLY_METRICS : DAILY_METRICS;
+  let m = String(raw || "").toLowerCase().trim();
+  const synonyms = {
+    "guest": "guests", "guest_count": "guests", "guestnum": "guests",
+    "check": "checks", "bills": "checks", "orders": "checks",
+    "revenue": "gross", "sales": "gross", "gross_revenue": "gross",
+    "net_revenue": "net", "avg_guest": "avg_per_guest", "revenue_per_guest": "avg_per_guest",
+    "average_check": "avg_check", "foodcost": "food_cost_pct", "food_cost": "food_cost_pct",
+    "quantity": "qty", "amount": "qty",
+  };
+  if (synonyms[m]) m = synonyms[m];
+  return valid.includes(m) ? m : valid[0];
 }
 
 function historyBlock(messages) {
@@ -474,23 +502,25 @@ function App() {
       const hist = historyBlock(prior);
       const p1 = await backend(cfg, { action: "chat", model,
         system: plannerSystem(catalog), user: hist + "Current question: " + q });
-      let plan;
-      try { plan = JSON.parse(p1.text.replace(/```json|```/g,"").trim()); }
-      catch { throw new Error("Planner returned invalid JSON"); }
+      const plan = extractJson(p1.text);
+      if (!plan) throw new Error("Planner returned invalid JSON");
       const dsets = ["daily","items","hourly","menu_matrix"];
-      const queries = (plan.queries || []).slice(0,4).map((qq,i) => ({
-        id: qq.id || "q"+(i+1),
-        dataset: dsets.includes(qq.dataset) ? qq.dataset : "daily",
-        metric: qq.dataset === "menu_matrix" ? "matrix" : (qq.metric || "gross"),
-        venue: ["LF","Caffelini","all"].includes(qq.venue) ? qq.venue : "all",
-        from: qq.from && qq.from >= catalog.from ? qq.from : catalog.from,
-        to: qq.to && qq.to <= catalog.to ? qq.to : catalog.to,
-        groupBy: qq.dataset === "menu_matrix" ? "item" : (qq.groupBy || "date"),
-        category: qq.category || undefined,
-        item_contains: qq.item_contains || undefined,
-        top: qq.top ? Math.min(Number(qq.top)||10, 25) : undefined,
-        label: qq.label,
-      }));
+      const queries = (plan.queries || []).slice(0,4).map((qq,i) => {
+        const dataset = dsets.includes(qq.dataset) ? qq.dataset : "daily";
+        return {
+          id: qq.id || "q"+(i+1),
+          dataset,
+          metric: dataset === "menu_matrix" ? "matrix" : normalizeMetric(qq.metric, dataset),
+          venue: ["LF","Caffelini","all"].includes(qq.venue) ? qq.venue : "all",
+          from: qq.from && qq.from >= catalog.from ? qq.from : catalog.from,
+          to: qq.to && qq.to <= catalog.to ? qq.to : catalog.to,
+          groupBy: dataset === "menu_matrix" ? "item" : (qq.groupBy || "date"),
+          category: qq.category || undefined,
+          item_contains: qq.item_contains || undefined,
+          top: qq.top ? Math.min(Number(qq.top)||10, 25) : undefined,
+          label: qq.label,
+        };
+      });
       if (!queries.length) throw new Error("Planner produced no queries");
 
       setStage("Querying warehouse…");
@@ -501,9 +531,13 @@ function App() {
         system: ANSWER_SYSTEM,
         user: hist + "Current question: " + q + "\n\nComputed results:\n" +
           JSON.stringify(results.map(r => r.matrix ? condenseMatrix(r) : condense(r))) });
-      let ans;
-      try { ans = JSON.parse(p2.text.replace(/```json|```/g,"").trim()); }
-      catch { ans = { answer: p2.text, charts: [] }; }
+      let ans = extractJson(p2.text);
+      if (!ans || !ans.answer) {
+        // fallback: показываем только текст без служебного JSON, если он протёк
+        const raw = String(p2.text || "").replace(/```json|```/g, "");
+        const cut = raw.indexOf('{"answer"');
+        ans = { answer: (cut > 0 ? raw.slice(0, cut) : raw).trim(), charts: [] };
+      }
       ans.answer = fixCurrency(ans.answer);
       (ans.charts || []).forEach(c => { c.title = fixCurrency(c.title); });
       const charts = (ans.charts || []).map(c => assembleChart(c, results)).filter(Boolean);
