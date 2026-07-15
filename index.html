@@ -218,6 +218,31 @@ function condenseMatrix(res) {
 }
 
 /* ================= CHART ASSEMBLY ================= */
+const metricUnit = m => m === "food_cost_pct" ? "%"
+  : ["gross","net","avg_per_guest","avg_check","cost","avg_price"].includes(m) ? "AED" : "";
+const SERIES_PALETTE = ["#1E6B4F","#C4762A","#3A6EA5","#A5433A"];
+
+/* Разные единицы (AED vs qty vs %) НИКОГДА не смешиваются на одной оси:
+   спека с разноединичными запросами разрезается на отдельные графики */
+function assembleCharts(spec, results) {
+  const rs = spec.queryIds.map(id => results.find(r => r.query.id === id && !r.matrix)).filter(Boolean);
+  if (!rs.length) return [];
+  const groups = {};
+  rs.forEach(r => {
+    const u = metricUnit(r.query.metric);
+    (groups[u] = groups[u] || []).push(r.query.id);
+  });
+  const units = Object.keys(groups);
+  return units.map(u => {
+    const sub = { ...spec, queryIds: groups[u] };
+    if (units.length > 1) {
+      const metric = results.find(r => r.query.id === groups[u][0]).query.metric;
+      sub.title = spec.title + " — " + metric;
+    }
+    return assembleChart(sub, results);
+  }).filter(Boolean);
+}
+
 function assembleChart(spec, results) {
   const rs = spec.queryIds.map(id => results.find(r => r.query.id === id && !r.matrix)).filter(Boolean);
   if (!rs.length) return null;
@@ -239,9 +264,12 @@ function assembleChart(spec, results) {
     name: r.query.label || `${r.query.venue} ${r.query.metric}`,
     color: VENUE_COLORS[r.query.venue] || VENUE_COLORS.all,
   }));
+  // одинаковый цвет у нескольких серий (одна точка, разные метрики) — раздаём палитру
+  if (new Set(series.map(s => s.color)).size < series.length) {
+    series.forEach((s, i) => { s.color = SERIES_PALETTE[i % SERIES_PALETTE.length]; });
+  }
   const metric = rs[0].query.metric;
-  const unit = metric === "food_cost_pct" ? "%"
-    : ["gross","net","avg_per_guest","avg_check","cost","avg_price"].includes(metric) ? "AED" : "";
+  const unit = metricUnit(metric);
   const truncate = s => (s && s.length > 16 ? s.slice(0,15) + "…" : s);
   const dataFinal = ["item","group","category"].includes(gb)
     ? data.map(d => ({ ...d, fullLabel: d.label, label: truncate(d.label) })) : data;
@@ -564,7 +592,7 @@ function App() {
       }
       ans.answer = fixCurrency(ans.answer);
       (ans.charts || []).forEach(c => { c.title = fixCurrency(c.title); });
-      const charts = (ans.charts || []).map(c => assembleChart(c, results)).filter(Boolean);
+      const charts = (ans.charts || []).flatMap(c => assembleCharts(c, results)).filter(Boolean);
       results.filter(r => r.matrix && r.matrix.items.length).forEach(r => {
         charts.push({ type: "matrix",
           title: r.query.venue + " — Menu Engineering (" + r.query.from + " → " + r.query.to + ")",
