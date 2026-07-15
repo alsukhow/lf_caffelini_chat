@@ -37,21 +37,32 @@ const MODELS = [
 const VENUE_COLORS = { LF: "#1E6B4F", Caffelini: "#C4762A", all: "#3A4A5A" };
 const MATRIX_CLASSES = { Star: "#1E6B4F", Plowhorse: "#C4762A", Puzzle: "#3A6EA5", Dog: "#A5433A" };
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const DAYPART_ORDER = ["Breakfast","Lunch","Dinner","Other"];
 
 const DAILY_METRICS = ["gross","net","checks","guests","avg_per_guest","avg_check"];
 const ITEM_METRICS = ["gross","net","qty","cost","food_cost_pct","avg_price"];
 const HOURLY_METRICS = ["gross","net","checks","guests","avg_per_guest"];
 
 /* ================= BACKEND CALLS ================= */
-async function backend(cfg, payload) {
-  const resp = await fetch(cfg.url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" }, // simple request: без preflight
-    body: JSON.stringify(Object.assign({ token: cfg.token }, payload)),
-  });
-  const data = await resp.json();
-  if (data.error) throw new Error(data.error);
-  return data;
+async function backend(cfg, payload, attempt) {
+  try {
+    const resp = await fetch(cfg.url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // simple request: без preflight
+      body: JSON.stringify(Object.assign({ token: cfg.token }, payload)),
+    });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+  } catch (e) {
+    // сетевые сбои (Load failed / Failed to fetch) — один повтор с паузой
+    const netErr = /load failed|failed to fetch|networkerror/i.test(String(e.message));
+    if (netErr && !attempt) {
+      await new Promise(r => setTimeout(r, 800));
+      return backend(cfg, payload, 1);
+    }
+    throw e;
+  }
 }
 
 /* ================= METRIC DERIVATION (детерминированно, на клиенте) ================= */
@@ -98,12 +109,12 @@ DATASETS:
 Amounts are AED. Net = gross after VAT & fees. Use prior conversation to resolve references like "the same but for Caffellini".
 Respond ONLY with JSON, no prose, no markdown:
 {"queries":[{"id":"q1","dataset":"daily"|"items"|"hourly"|"menu_matrix","metric":"...","venue":"LF"|"Caffelini"|"all","from":"YYYY-MM-DD","to":"YYYY-MM-DD","groupBy":"...","category":"opt","item_contains":"opt","top":10,"label":"short series name"}]}
-Rules: to compare venues over time, one query per venue (same groupBy). If the question asks for SEVERAL metrics (e.g. guests AND avg per guest), emit a SEPARATE query per metric — "metric" must be exactly ONE value from the dataset's list. Max 4 queries. Clamp dates to available range.`;
+Rules: to compare venues over time, one query per venue (same groupBy). If the question asks for SEVERAL metrics (e.g. guests AND avg per guest), emit a SEPARATE query per metric — "metric" must be exactly ONE value from the dataset's list. Item and category names in the data are in ENGLISH — always translate "category" and "item_contains" filters to English (пицца -> pizza, пинса -> pinsa, вино -> wine, коктейли -> cocktail). Max 4 queries. Clamp dates to available range.`;
 }
 
 const ANSWER_SYSTEM = `You are a sharp F&B financial analyst writing for a CFO. You receive a user question, optional prior conversation, and PRE-COMPUTED query results (computed by code — trust these numbers exactly, never recalculate, never second-guess or invent numbers). Each result is labeled with its query (dataset, metric, venue, period) — the values ARE that metric.
 CURRENCY RULE (critical): ALL monetary values are UAE dirhams. NEVER use "$", "USD" or "dollars". Write amounts as "3.56M AED", "604.6K AED", "1,778 AED". Non-monetary metrics (guests, checks, qty) have no currency.
-OUTPUT FORMAT (critical): your ENTIRE output must be a single JSON object. Start with "{" and end with "}". No preamble, no reasoning, no markdown, nothing outside the JSON.
+OUTPUT FORMAT (critical): your ENTIRE output must be a single JSON object. Start with "{" and end with "}". No preamble, no reasoning, no markdown, nothing outside the JSON. Inside the "answer" string NEVER use unescaped double quotes — for names/titles use «guillemets» or single quotes (e.g. «Cervaro della Sala»).
 {"answer":"2-6 sentences, plain text, in the same language as the user question, cite the key numbers, be direct and note anything unusual","charts":[{"title":"...","type":"line"|"bar"|"area","queryIds":["q1"]}]}
 Charts: only when they add value; combine queries with the same groupBy; "bar" for weekday/venue/month/hour/daypart comparisons, "line"/"area" for date series. 0-2 charts. Do not chart menu_matrix results (visualized by code).`;
 
@@ -125,6 +136,24 @@ function extractJson(text) {
     try { return JSON.parse(clean.slice(a, b + 1)); } catch {}
   }
   return null;
+}
+
+/* Последний рубеж: JSON битый (например, неэкранированные кавычки внутри строки) —
+   вырезаем человеческий текст между маркерами "answer" и "charts" */
+function salvageAnswer(text) {
+  const raw = String(text || "").replace(/```json|```/g, "");
+  const start = raw.indexOf('"answer"');
+  if (start >= 0) {
+    const colon = raw.indexOf(":", start);
+    const q1 = raw.indexOf('"', colon + 1);
+    let end = raw.lastIndexOf('","charts"');
+    if (end < 0) end = raw.lastIndexOf('"charts"');
+    if (end < 0) end = raw.lastIndexOf('"}');
+    if (q1 >= 0 && end > q1) {
+      return raw.slice(q1 + 1, end).replace(/\\n/g, "\n").replace(/\\"/g, '"').trim();
+    }
+  }
+  return raw.trim();
 }
 
 /* Нормализация метрики: синонимы -> словарь; невалидная -> первая валидная (никогда молча в gross) */
@@ -198,6 +227,7 @@ function assembleChart(spec, results) {
     const order = rs[0].values.map(x => x.label);
     labels.sort((a,b)=>order.indexOf(a)-order.indexOf(b));
   } else if (gb === "weekday") labels.sort((a,b)=>WEEKDAYS.indexOf(a)-WEEKDAYS.indexOf(b));
+  else if (gb === "daypart") labels.sort((a,b)=>DAYPART_ORDER.indexOf(a)-DAYPART_ORDER.indexOf(b));
   else labels.sort();
   const data = labels.map(l => {
     const row = { label: l };
@@ -257,7 +287,9 @@ function ChartBlock({ chart }) {
     <Tooltip key="t" formatter={v => fmt(v) + (chart.unit ? " " + chart.unit : "")}
       labelFormatter={(l, p) => p && p[0] && p[0].payload.fullLabel ? p[0].payload.fullLabel : l}
       contentStyle={{background:"#FFF", border:"1px solid #D5D9D3", borderRadius:8, fontSize:12}} />,
-    <Legend key="l" wrapperStyle={{fontSize:12}} verticalAlign="top" />,
+    chart.series.length > 1
+      ? <Legend key="l" wrapperStyle={{fontSize:12}} verticalAlign="top" />
+      : null,
   ];
   return (
     <div style={{marginTop:12, borderRadius:12, border:"1px solid #E0E2DC", background:"#fff", padding:12}}>
@@ -467,26 +499,21 @@ function App() {
   }, [active && active.id]);
 
   async function runQueries(queries) {
-    const results = [];
-    for (const q of queries) {
+    return Promise.all(queries.map(async q => {
       if (q.dataset === "menu_matrix") {
         const resp = await backend(cfg, { action: "query", query: {
           dataset: "items", venue: q.venue, from: q.from, to: q.to,
           groupBy: "item", category: q.category } });
-        results.push({ query: q, matrix: classifyMatrix(resp.rows) });
-      } else {
-        const resp = await backend(cfg, { action: "query", query: {
-          dataset: q.dataset, venue: q.venue, from: q.from, to: q.to,
-          groupBy: q.groupBy, category: q.category, item_contains: q.item_contains,
-          top: q.top, sortBy: ["food_cost_pct","avg_price","avg_per_guest","avg_check"].includes(q.metric) ? "gross" : q.metric } });
-        results.push({ query: q, values: resp.rows.map(r => ({ label: r.label, value: deriveMetric(r, q.metric) }))
-          .concat([]).slice(0) , raw: resp.rows });
-        // top-N по производной метрике — сортировка на клиенте
-        const last = results[results.length-1];
-        if (q.top) { last.values.sort((a,b)=>b.value-a.value); last.values = last.values.slice(0, q.top); }
+        return { query: q, matrix: classifyMatrix(resp.rows) };
       }
-    }
-    return results;
+      const resp = await backend(cfg, { action: "query", query: {
+        dataset: q.dataset, venue: q.venue, from: q.from, to: q.to,
+        groupBy: q.groupBy, category: q.category, item_contains: q.item_contains,
+        top: q.top, sortBy: ["food_cost_pct","avg_price","avg_per_guest","avg_check"].includes(q.metric) ? "gross" : q.metric } });
+      const res = { query: q, values: resp.rows.map(r => ({ label: r.label, value: deriveMetric(r, q.metric) })), raw: resp.rows };
+      if (q.top) { res.values.sort((a,b)=>b.value-a.value); res.values = res.values.slice(0, q.top); }
+      return res;
+    }));
   }
 
   async function ask(question) {
@@ -533,10 +560,7 @@ function App() {
           JSON.stringify(results.map(r => r.matrix ? condenseMatrix(r) : condense(r))) });
       let ans = extractJson(p2.text);
       if (!ans || !ans.answer) {
-        // fallback: показываем только текст без служебного JSON, если он протёк
-        const raw = String(p2.text || "").replace(/```json|```/g, "");
-        const cut = raw.indexOf('{"answer"');
-        ans = { answer: (cut > 0 ? raw.slice(0, cut) : raw).trim(), charts: [] };
+        ans = { answer: salvageAnswer(p2.text), charts: [] };
       }
       ans.answer = fixCurrency(ans.answer);
       (ans.charts || []).forEach(c => { c.title = fixCurrency(c.title); });
