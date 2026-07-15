@@ -20,7 +20,7 @@
 <script type="text/babel" data-presets="env,react">
 const { useState, useRef, useEffect, useCallback } = React;
 const {
-  LineChart, Line, BarChart, Bar, AreaChart, Area,
+  LineChart, Line, BarChart, Bar, AreaChart, Area, ComposedChart,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LabelList,
   ScatterChart, Scatter, ReferenceLine,
 } = Recharts;
@@ -39,7 +39,7 @@ const MATRIX_CLASSES = { Star: "#1E6B4F", Plowhorse: "#C4762A", Puzzle: "#3A6EA5
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const DAYPART_ORDER = ["Breakfast","Lunch","Dinner","Other"];
 
-const APP_VERSION = "v7";
+const APP_VERSION = "v8";
 const TABLES = { LF: 31 }; // посадочных столов; Caffellini — grab&go, метрика не применима
 const DAILY_METRICS = ["gross","net","checks","guests","avg_per_guest","avg_check"];
 const ITEM_METRICS = ["gross","net","qty","cost","food_cost_pct","avg_price"];
@@ -238,6 +238,10 @@ function assembleCharts(spec, results) {
     (groups[u] = groups[u] || []).push(r.query.id);
   });
   const units = Object.keys(groups);
+  if (units.length === 2) {
+    const combo = assembleCombo(spec, results, groups, units);
+    if (combo) return [combo];
+  }
   return units.map(u => {
     const sub = { ...spec, queryIds: groups[u] };
     if (units.length > 1) {
@@ -246,6 +250,42 @@ function assembleCharts(spec, results) {
     }
     return assembleChart(sub, results);
   }).filter(Boolean);
+}
+
+/* Две разные единицы (например qty и AED) — один график с двумя осями Y */
+function assembleCombo(spec, results, groups, units) {
+  const rs = spec.queryIds.map(id => results.find(r => r.query.id === id && !r.matrix)).filter(Boolean);
+  if (!rs.length) return null;
+  const labels = [...new Set(rs.flatMap(r => r.values.map(x => x.label)))];
+  const gb = rs[0].query.groupBy;
+  const topQ = rs.find(r => r.query.top);
+  if (topQ) {
+    const order = topQ.values.map(x => x.label);
+    labels.sort((a,b)=>order.indexOf(a)-order.indexOf(b));
+  } else if (gb === "weekday") labels.sort((a,b)=>WEEKDAYS.indexOf(a)-WEEKDAYS.indexOf(b));
+  else if (gb === "daypart") labels.sort((a,b)=>DAYPART_ORDER.indexOf(a)-DAYPART_ORDER.indexOf(b));
+  else labels.sort();
+  const data = labels.map(l => {
+    const row = { label: l };
+    rs.forEach(r => { const f = r.values.find(x=>x.label===l); row[r.query.id] = f ? f.value : null; });
+    return row;
+  });
+  const seriesOf = (ids, offset) => ids.map((id, i) => {
+    const r = rs.find(x => x.query.id === id);
+    return {
+      key: id,
+      name: (r.query.label || (r.query.venue + " " + r.query.metric)),
+      color: SERIES_PALETTE[(offset + i) % SERIES_PALETTE.length],
+      unit: metricUnit(r.query.metric),
+    };
+  });
+  const barSeries = seriesOf(groups[units[0]], 0);
+  const lineSeries = seriesOf(groups[units[1]], barSeries.length);
+  const truncate = s => (s && s.length > 16 ? s.slice(0,15) + "…" : s);
+  const dataFinal = ["item","group","category"].includes(gb)
+    ? data.map(d => ({ ...d, fullLabel: d.label, label: truncate(d.label) })) : data;
+  return { type: "combo", title: spec.title, data: dataFinal, groupBy: gb,
+    barSeries, lineSeries, unitLeft: units[0] || "qty", unitRight: units[1] || "qty" };
 }
 
 function assembleChart(spec, results) {
@@ -302,6 +342,7 @@ const AngledTick = ({ x, y, payload }) => (
 
 function ChartBlock({ chart }) {
   if (chart.type === "matrix") return <MatrixBlock chart={chart} />;
+  if (chart.type === "combo") return <ComboBlock chart={chart} />;
   const showLabels = chart.data.length <= 14;
   const categorical = ["item","group","category","venue","weekday","hour","daypart","month"]
     .includes(chart.groupBy) && chart.data.length <= 20;
@@ -355,6 +396,59 @@ function ChartBlock({ chart }) {
               ))}
             </LineChart>
           )}
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function ComboBlock({ chart }) {
+  const categorical = ["item","group","category","venue","weekday","hour","daypart","month"]
+    .includes(chart.groupBy) && chart.data.length <= 20;
+  const unitByKey = {};
+  chart.barSeries.concat(chart.lineSeries).forEach(s => { unitByKey[s.key] = s.unit; });
+  const title = chart.title +
+    " · bars: " + (chart.unitLeft || "qty") + " / line: " + (chart.unitRight || "qty");
+  return (
+    <div style={{marginTop:12, borderRadius:12, border:"1px solid #E0E2DC", background:"#fff", padding:12}}>
+      <div style={{fontSize:11, fontWeight:600, letterSpacing:.5, textTransform:"uppercase", color:"#78807B", marginBottom:4}}>
+        {title}
+      </div>
+      <div style={{width:"100%", height: categorical ? 320 : 270}}>
+        <ResponsiveContainer>
+          <ComposedChart data={chart.data} margin={{top:24, right:8, left:8, bottom: categorical ? 8 : 4}}>
+            <CartesianGrid stroke="#E3E6E0" vertical={false} />
+            {categorical
+              ? <XAxis dataKey="label" tick={<AngledTick />} interval={0} height={84}
+                  tickLine={{stroke:"#B9BFB8"}} axisLine={{stroke:"#9AA19A"}} />
+              : <XAxis dataKey="label" tick={{fontSize:11, fill:"#4B524E"}}
+                  tickLine={{stroke:"#B9BFB8"}} axisLine={{stroke:"#9AA19A"}}
+                  interval="preserveStartEnd" minTickGap={18} />}
+            <YAxis yAxisId="left" tick={{fontSize:11, fill:"#4B524E"}} tickLine={false}
+              axisLine={{stroke:"#9AA19A"}} tickFormatter={fmtShort} width={48} />
+            <YAxis yAxisId="right" orientation="right" tick={{fontSize:11, fill:"#4B524E"}}
+              tickLine={false} axisLine={{stroke:"#9AA19A"}} tickFormatter={fmtShort} width={48} />
+            <Tooltip
+              formatter={(v, name, props) => {
+                const u = props && props.dataKey ? unitByKey[props.dataKey] : "";
+                return [fmt(v) + (u ? " " + u : ""), name];
+              }}
+              labelFormatter={(l, p) => p && p[0] && p[0].payload.fullLabel ? p[0].payload.fullLabel : l}
+              contentStyle={{background:"#FFF", border:"1px solid #D5D9D3", borderRadius:8, fontSize:12}} />
+            <Legend wrapperStyle={{fontSize:12}} verticalAlign="top" />
+            {chart.barSeries.map(s => (
+              <Bar key={s.key} yAxisId="left" dataKey={s.key} name={s.name}
+                fill={s.color} radius={[3,3,0,0]}>
+                {chart.data.length <= 14 &&
+                  <LabelList dataKey={s.key} position="top" formatter={fmtShort}
+                    style={{fontSize:10, fill:"#3A403C"}} />}
+              </Bar>
+            ))}
+            {chart.lineSeries.map(s => (
+              <Line key={s.key} yAxisId="right" dataKey={s.key} name={s.name}
+                stroke={s.color} strokeWidth={2.5} dot={{r:3}} connectNulls />
+            ))}
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
     </div>
