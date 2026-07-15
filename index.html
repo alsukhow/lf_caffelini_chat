@@ -39,9 +39,10 @@ const MATRIX_CLASSES = { Star: "#1E6B4F", Plowhorse: "#C4762A", Puzzle: "#3A6EA5
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const DAYPART_ORDER = ["Breakfast","Lunch","Dinner","Other"];
 
+const APP_VERSION = "v6";
 const DAILY_METRICS = ["gross","net","checks","guests","avg_per_guest","avg_check"];
 const ITEM_METRICS = ["gross","net","qty","cost","food_cost_pct","avg_price"];
-const HOURLY_METRICS = ["gross","net","checks","guests","avg_per_guest"];
+const HOURLY_METRICS = ["gross","net","qty","checks","guests","avg_per_guest"];
 
 /* ================= BACKEND CALLS ================= */
 async function backend(cfg, payload, attempt) {
@@ -103,8 +104,8 @@ function plannerSystem(cat) {
   return `You are a query planner for an F&B analytics engine of ISD (Dubai). Venues: "LF" (La Famiglia, Italian restaurant) and "Caffelini" (Caffellini café). Data available from ${cat.from} to ${cat.to}. Today is ${new Date().toISOString().slice(0,10)}.
 DATASETS:
 1. "daily" — venue-day totals. Metrics: ${DAILY_METRICS.join(", ")}. groupBy: date|month|weekday|venue|none.
-2. "items" — menu-item sales. Metrics: ${ITEM_METRICS.join(", ")} (food_cost_pct in %, avg_price = gross/qty). groupBy: item|category|group|date|month|weekday|venue|none. Filters: "category" (matches category or group name), "item_contains". Optional "top": N.
-3. "hourly" — sales by hour of day. Metrics: ${HOURLY_METRICS.join(", ")}. groupBy: hour|daypart|date|month|weekday|venue|none. Dayparts: ${cat.dayparts.map(d=>d.name+" "+d.from+"-"+d.to).join(", ")}.
+2. "items" — menu-item sales per DAY (item, category, group). Metrics: ${ITEM_METRICS.join(", ")} (food_cost_pct in %, avg_price = gross/qty). groupBy: item|category|group|date|month|weekday|venue|none. Filters: "category" (matches category or group name), "item_contains". Optional "top": N. NOTE: items has NO hour dimension — for any hour breakdown use "hourly".
+3. "hourly" — sales by hour of day, with menu group dimension. Metrics: ${HOURLY_METRICS.join(", ")}. groupBy: hour|daypart|group|date|month|weekday|venue|none. Optional filter "category" (matches menu group, e.g. pizza, pinsa, pasta). Dayparts: ${cat.dayparts.map(d=>d.name+" "+d.from+"-"+d.to).join(", ")}. IMPORTANT: when "category" filter is used, only gross and qty are valid metrics (guests/checks would double-count across groups).
 4. "menu_matrix" — Kasavana-Smith menu engineering (Star/Plowhorse/Puzzle/Dog). Use for menu engineering / promote-remove-reprice questions. Fields: venue (single venue preferred), from, to, optional category. Max ONE per turn.
 Amounts are AED. Net = gross after VAT & fees. Use prior conversation to resolve references like "the same but for Caffellini".
 Respond ONLY with JSON, no prose, no markdown:
@@ -662,6 +663,8 @@ function App() {
               <span style={{fontFamily:"Iowan Old Style, Georgia, serif", fontSize:18, fontWeight:600, color:"#1A1D1B"}}>
                 F&amp;B Copilot
               </span>
+              <span className="mono" style={{fontSize:10, color:"#B0B6AF", border:"1px solid #E0E2DC",
+                borderRadius:6, padding:"1px 5px"}}>{APP_VERSION}</span>
               <span className="mono" style={{fontSize:11, color:"#9AA19A"}}>
                 {catalog.from} → {catalog.to}
               </span>
