@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>F&B Copilot — ISD</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #F2F3EF; font-family: system-ui, -apple-system, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="env,react">
+const { useState, useRef, useEffect, useCallback } = React;
+const {
+  LineChart, Line, BarChart, Bar, AreaChart, Area,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LabelList,
+  ScatterChart, Scatter, ReferenceLine,
+} = Recharts;
+
+/* ================= CONFIG / STATE ================= */
+const LS_CFG = "fnb-copilot-config";
+const LS_CHATS = "fnb-copilot-chats";
+
+const MODELS = [
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6 — default" },
+  { id: "claude-opus-4-8", label: "Opus 4.8 — deeper analysis" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5 — fastest" },
+];
+const VENUE_COLORS = { LF: "#1E6B4F", Caffelini: "#C4762A", all: "#3A4A5A" };
+const MATRIX_CLASSES = { Star: "#1E6B4F", Plowhorse: "#C4762A", Puzzle: "#3A6EA5", Dog: "#A5433A" };
+const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+const DAILY_METRICS = ["gross","net","checks","guests","avg_per_guest","avg_check"];
+const ITEM_METRICS = ["gross","net","qty","cost","food_cost_pct","avg_price"];
+const HOURLY_METRICS = ["gross","net","checks","guests","avg_per_guest"];
+
+/* ================= BACKEND CALLS ================= */
+async function backend(cfg, payload) {
+  const resp = await fetch(cfg.url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // simple request: без preflight
+    body: JSON.stringify(Object.assign({ token: cfg.token }, payload)),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+/* ================= METRIC DERIVATION (детерминированно, на клиенте) ================= */
+function deriveMetric(row, metric) {
+  if (metric === "gross") return row.gross;
+  if (metric === "net") return row.net;
+  if (metric === "qty") return row.qty;
+  if (metric === "cost") return row.cost;
+  if (metric === "checks") return row.checks;
+  if (metric === "guests") return row.guests;
+  if (metric === "avg_per_guest") return row.guests ? r2(row.gross / row.guests) : 0;
+  if (metric === "avg_check") return row.checks ? r2(row.gross / row.checks) : 0;
+  if (metric === "food_cost_pct") return row.gross ? r2(100 * row.cost / row.gross) : 0;
+  if (metric === "avg_price") return row.qty ? r2(row.gross / row.qty) : 0;
+  return row.gross;
+}
+const r2 = v => Math.round(v * 100) / 100;
+
+function classifyMatrix(rows) {
+  const items = rows.filter(r => r.qty > 0).map(r => ({
+    item: r.label, qty: r.qty, gross: Math.round(r.gross),
+    cmUnit: r.qty ? r2((r.gross - r.cost) / r.qty) : 0,
+  }));
+  if (!items.length) return { items: [], popTh: 0, cmTh: 0 };
+  const totalQty = items.reduce((s,i)=>s+i.qty,0);
+  const popTh = (totalQty / items.length) * 0.7;
+  const cmTh = items.reduce((s,i)=>s+i.cmUnit*i.qty,0) / totalQty;
+  items.forEach(i => {
+    const pop = i.qty >= popTh, cm = i.cmUnit >= cmTh;
+    i.cls = pop && cm ? "Star" : pop && !cm ? "Plowhorse" : !pop && cm ? "Puzzle" : "Dog";
+  });
+  items.sort((a,b)=>b.gross-a.gross);
+  return { items, popTh: Math.round(popTh), cmTh: r2(cmTh) };
+}
+
+/* ================= PROMPTS ================= */
+function plannerSystem(cat) {
+  return `You are a query planner for an F&B analytics engine of ISD (Dubai). Venues: "LF" (La Famiglia, Italian restaurant) and "Caffelini" (Caffellini café). Data available from ${cat.from} to ${cat.to}. Today is ${new Date().toISOString().slice(0,10)}.
+DATASETS:
+1. "daily" — venue-day totals. Metrics: ${DAILY_METRICS.join(", ")}. groupBy: date|month|weekday|venue|none.
+2. "items" — menu-item sales. Metrics: ${ITEM_METRICS.join(", ")} (food_cost_pct in %, avg_price = gross/qty). groupBy: item|category|group|date|month|weekday|venue|none. Filters: "category" (matches category or group name), "item_contains". Optional "top": N.
+3. "hourly" — sales by hour of day. Metrics: ${HOURLY_METRICS.join(", ")}. groupBy: hour|daypart|date|month|weekday|venue|none. Dayparts: ${cat.dayparts.map(d=>d.name+" "+d.from+"-"+d.to).join(", ")}.
+4. "menu_matrix" — Kasavana-Smith menu engineering (Star/Plowhorse/Puzzle/Dog). Use for menu engineering / promote-remove-reprice questions. Fields: venue (single venue preferred), from, to, optional category. Max ONE per turn.
+Amounts are AED. Net = gross after VAT & fees. Use prior conversation to resolve references like "the same but for Caffellini".
+Respond ONLY with JSON, no prose, no markdown:
+{"queries":[{"id":"q1","dataset":"daily"|"items"|"hourly"|"menu_matrix","metric":"...","venue":"LF"|"Caffelini"|"all","from":"YYYY-MM-DD","to":"YYYY-MM-DD","groupBy":"...","category":"opt","item_contains":"opt","top":10,"label":"short series name"}]}
+Rules: to compare venues over time, one query per venue (same groupBy). Max 4 queries. Clamp dates to available range.`;
+}
+
+const ANSWER_SYSTEM = `You are a sharp F&B financial analyst writing for a CFO. You receive a user question, optional prior conversation, and PRE-COMPUTED query results (computed by code — trust these numbers exactly, never recalculate or invent numbers).
+CURRENCY RULE (critical): ALL monetary values are UAE dirhams. NEVER use "$", "USD" or "dollars". Write amounts as "3.56M AED", "604.6K AED", "1,778 AED". Non-monetary metrics (guests, checks, qty) have no currency.
+Respond ONLY with JSON, no markdown fences:
+{"answer":"2-6 sentences, plain text, in the same language as the user question, cite the key numbers, be direct and note anything unusual","charts":[{"title":"...","type":"line"|"bar"|"area","queryIds":["q1"]}]}
+Charts: only when they add value; combine queries with the same groupBy; "bar" for weekday/venue/month/hour comparisons, "line"/"area" for date series. 0-2 charts. Do not chart menu_matrix results (visualized by code).`;
+
+function fixCurrency(text) {
+  if (!text) return text;
+  return text
+    .replace(/\$\s?([\d.,]+\s?[KkMm]?)/g, "$1 AED")
+    .replace(/\bUSD\b/g, "AED")
+    .replace(/\bdollars?\b/gi, "AED")
+    .replace(/\bдоллар(ов|а|ы)?\b/gi, "AED");
+}
+
+function historyBlock(messages) {
+  const turns = [];
+  messages.slice(-8).forEach(m => {
+    if (m.role === "user") turns.push("USER: " + m.text);
+    else {
+      const plans = (m.queries || []).map(q =>
+        `${q.dataset}/${q.venue}/${q.metric}/${q.from}->${q.to}/by ${q.groupBy}`).join("; ");
+      turns.push("ASSISTANT (plan: " + (plans || "none") + "): " + (m.text || "").slice(0, 300));
+    }
+  });
+  return turns.length ? "Prior conversation:\n" + turns.join("\n") + "\n\n" : "";
+}
+
+function condense(res) {
+  const r = res.values;
+  const vals = r.map(x => x.value);
+  const sum = vals.reduce((a,b)=>a+b,0);
+  return {
+    query: res.query,
+    stats: {
+      points: r.length, sum: r2(sum),
+      mean: r.length ? r2(sum/r.length) : 0,
+      min: r.length ? Math.min(...vals) : 0,
+      max: r.length ? Math.max(...vals) : 0,
+      first: r[0], last: r[r.length-1],
+    },
+    sample: r.length <= 40 ? r : r.filter((_,i)=> i % Math.ceil(r.length/40) === 0),
+  };
+}
+function condenseMatrix(res) {
+  const m = res.matrix, byClass = {};
+  m.items.forEach(i => {
+    byClass[i.cls] = byClass[i.cls] || [];
+    if (byClass[i.cls].length < 5) byClass[i.cls].push({ item: i.item, qty: i.qty, cmUnit: i.cmUnit });
+  });
+  return {
+    query: res.query, type: "menu_matrix",
+    thresholds: { popularity_qty: m.popTh, cm_per_unit_AED: m.cmTh },
+    counts: Object.fromEntries(Object.keys(MATRIX_CLASSES).map(c =>
+      [c, m.items.filter(i=>i.cls===c).length])),
+    examples: byClass,
+  };
+}
+
+/* ================= CHART ASSEMBLY ================= */
+function assembleChart(spec, results) {
+  const rs = spec.queryIds.map(id => results.find(r => r.query.id === id && !r.matrix)).filter(Boolean);
+  if (!rs.length) return null;
+  const labels = [...new Set(rs.flatMap(r => r.values.map(x => x.label)))];
+  const gb = rs[0].query.groupBy;
+  if (rs[0].query.top) {
+    const order = rs[0].values.map(x => x.label);
+    labels.sort((a,b)=>order.indexOf(a)-order.indexOf(b));
+  } else if (gb === "weekday") labels.sort((a,b)=>WEEKDAYS.indexOf(a)-WEEKDAYS.indexOf(b));
+  else labels.sort();
+  const data = labels.map(l => {
+    const row = { label: l };
+    rs.forEach(r => { const f = r.values.find(x=>x.label===l); row[r.query.id] = f ? f.value : null; });
+    return row;
+  });
+  const series = rs.map(r => ({
+    key: r.query.id,
+    name: r.query.label || `${r.query.venue} ${r.query.metric}`,
+    color: VENUE_COLORS[r.query.venue] || VENUE_COLORS.all,
+  }));
+  const metric = rs[0].query.metric;
+  const unit = metric === "food_cost_pct" ? "%"
+    : ["gross","net","avg_per_guest","avg_check","cost","avg_price"].includes(metric) ? "AED" : "";
+  const truncate = s => (s && s.length > 16 ? s.slice(0,15) + "…" : s);
+  const dataFinal = ["item","group","category"].includes(gb)
+    ? data.map(d => ({ ...d, fullLabel: d.label, label: truncate(d.label) })) : data;
+  return { ...spec, data: dataFinal, series, unit, groupBy: gb };
+}
+
+/* ================= UI HELPERS ================= */
+const fmt = v => (v===null||v===undefined ? "" :
+  Math.abs(v)>=1000 ? Math.round(v).toLocaleString("en-US") : Number(v).toLocaleString("en-US"));
+const fmtShort = v => {
+  if (v===null||v===undefined) return "";
+  if (Math.abs(v)>=1000000) return (v/1000000).toFixed(1)+"M";
+  if (Math.abs(v)>=10000) return Math.round(v/1000)+"k";
+  if (Math.abs(v)>=1000) return (v/1000).toFixed(1)+"k";
+  return String(Math.round(v*10)/10);
+};
+
+const AngledTick = ({ x, y, payload }) => (
+  <g transform={`translate(${x},${y})`}>
+    <text dy={8} dx={-4} textAnchor="end" transform="rotate(-35)" fontSize={10} fill="#4B524E">
+      {payload.value}
+    </text>
+  </g>
+);
+
+function ChartBlock({ chart }) {
+  if (chart.type === "matrix") return <MatrixBlock chart={chart} />;
+  const showLabels = chart.data.length <= 14;
+  const categorical = ["item","group","category","venue","weekday","hour","daypart","month"]
+    .includes(chart.groupBy) && chart.data.length <= 20;
+  const common = { data: chart.data, margin: { top: 24, right: 16, left: 8, bottom: categorical ? 8 : 4 } };
+  // массив, не фрагмент: часть версий recharts не разворачивает фрагменты
+  const axes = [
+    <CartesianGrid key="g" stroke="#E3E6E0" vertical={false} />,
+    categorical
+      ? <XAxis key="x" dataKey="label" tick={<AngledTick />} interval={0} height={84}
+          tickLine={{stroke:"#B9BFB8"}} axisLine={{stroke:"#9AA19A"}} />
+      : <XAxis key="x" dataKey="label" tick={{fontSize:11, fill:"#4B524E"}}
+          tickLine={{stroke:"#B9BFB8"}} axisLine={{stroke:"#9AA19A"}}
+          interval="preserveStartEnd" minTickGap={18} />,
+    <YAxis key="y" tick={{fontSize:11, fill:"#4B524E"}} tickLine={false}
+      axisLine={{stroke:"#9AA19A"}} tickFormatter={fmtShort} width={48} />,
+    <Tooltip key="t" formatter={v => fmt(v) + (chart.unit ? " " + chart.unit : "")}
+      labelFormatter={(l, p) => p && p[0] && p[0].payload.fullLabel ? p[0].payload.fullLabel : l}
+      contentStyle={{background:"#FFF", border:"1px solid #D5D9D3", borderRadius:8, fontSize:12}} />,
+    <Legend key="l" wrapperStyle={{fontSize:12}} verticalAlign="top" />,
+  ];
+  return (
+    <div style={{marginTop:12, borderRadius:12, border:"1px solid #E0E2DC", background:"#fff", padding:12}}>
+      <div style={{fontSize:11, fontWeight:600, letterSpacing:.5, textTransform:"uppercase", color:"#78807B", marginBottom:4}}>
+        {chart.title}{chart.unit ? " · " + chart.unit : ""}
+      </div>
+      <div style={{width:"100%", height: categorical ? 310 : 260}}>
+        <ResponsiveContainer>
+          {chart.type === "bar" ? (
+            <BarChart {...common}>{axes}
+              {chart.series.map(s => (
+                <Bar key={s.key} dataKey={s.key} name={s.name} fill={s.color} radius={[3,3,0,0]}>
+                  {showLabels && <LabelList dataKey={s.key} position="top" formatter={fmtShort}
+                    style={{fontSize:10, fill:"#3A403C"}} />}
+                </Bar>
+              ))}
+            </BarChart>
+          ) : chart.type === "area" ? (
+            <AreaChart {...common}>{axes}
+              {chart.series.map(s => (
+                <Area key={s.key} dataKey={s.key} name={s.name} stroke={s.color}
+                  fill={s.color} fillOpacity={0.12} strokeWidth={2} connectNulls />
+              ))}
+            </AreaChart>
+          ) : (
+            <LineChart {...common}>{axes}
+              {chart.series.map(s => (
+                <Line key={s.key} dataKey={s.key} name={s.name} stroke={s.color}
+                  strokeWidth={2} dot={chart.data.length <= 20} connectNulls />
+              ))}
+            </LineChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function MatrixBlock({ chart }) {
+  const m = chart.matrix;
+  const byClass = cls => m.items.filter(i => i.cls === cls);
+  const HINT = {
+    Star: "promote & protect",
+    Plowhorse: "popular, low margin — reprice / re-engineer cost",
+    Puzzle: "high margin, low sales — reposition / feature",
+    Dog: "candidates to review / remove",
+  };
+  return (
+    <div style={{marginTop:12, borderRadius:12, border:"1px solid #E0E2DC", background:"#fff", padding:12}}>
+      <div style={{fontSize:11, fontWeight:600, letterSpacing:.5, textTransform:"uppercase", color:"#78807B", marginBottom:4}}>
+        {chart.title}
+      </div>
+      <div style={{width:"100%", height:300}}>
+        <ResponsiveContainer>
+          <ScatterChart margin={{top:16, right:20, left:8, bottom:8}}>
+            <CartesianGrid stroke="#E3E6E0" />
+            <XAxis type="number" dataKey="qty" name="Qty" tick={{fontSize:11, fill:"#4B524E"}}
+              axisLine={{stroke:"#9AA19A"}} />
+            <YAxis type="number" dataKey="cmUnit" name="CM/unit" tick={{fontSize:11, fill:"#4B524E"}}
+              axisLine={{stroke:"#9AA19A"}} tickFormatter={fmtShort} width={48} />
+            <ReferenceLine x={m.popTh} stroke="#9AA19A" strokeDasharray="4 4" />
+            <ReferenceLine y={m.cmTh} stroke="#9AA19A" strokeDasharray="4 4" />
+            <Tooltip content={({payload}) => payload && payload.length ? (
+              <div style={{background:"#fff", border:"1px solid #D5D9D3", borderRadius:8,
+                padding:"6px 10px", fontSize:12}} className="mono">
+                <div style={{fontWeight:600}}>{payload[0].payload.item}</div>
+                <div>{payload[0].payload.cls} · qty {fmt(payload[0].payload.qty)} · CM {fmt(payload[0].payload.cmUnit)} AED</div>
+              </div>
+            ) : null} />
+            {Object.keys(MATRIX_CLASSES).map(cls => (
+              <Scatter key={cls} name={cls} data={byClass(cls)} fill={MATRIX_CLASSES[cls]} fillOpacity={0.85} />
+            ))}
+            <Legend wrapperStyle={{fontSize:12}} verticalAlign="top" />
+          </ScatterChart>
+        </ResponsiveContainer>
+      </div>
+      <div style={{marginTop:8, display:"grid", gap:8, gridTemplateColumns:"repeat(auto-fit, minmax(240px, 1fr))"}}>
+        {Object.keys(MATRIX_CLASSES).map(cls => (
+          <div key={cls} style={{borderRadius:8, border:"1px solid #E5E7E1", background:"#FAFBF8", padding:8}}>
+            <div style={{fontSize:12, fontWeight:600, color:MATRIX_CLASSES[cls]}}>
+              {cls} ({byClass(cls).length}) <span style={{fontWeight:400, color:"#78807B"}}>— {HINT[cls]}</span>
+            </div>
+            <div className="mono" style={{marginTop:4, fontSize:11, lineHeight:1.5, color:"#5A615C"}}>
+              {byClass(cls).slice(0,4).map(i => `${i.item} (${fmt(i.qty)} · ${fmt(i.cmUnit)} AED)`).join(" · ") || "—"}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mono" style={{marginTop:8, fontSize:11, color:"#9AA19A"}}>
+        thresholds: popularity ≥ {fmt(m.popTh)} qty (70% rule) · CM ≥ {fmt(m.cmTh)} AED/unit (weighted avg)
+      </div>
+    </div>
+  );
+}
+
+function QueryChips({ queries, modelUsed, live }) {
+  return (
+    <div style={{marginTop:12, display:"flex", flexWrap:"wrap", gap:6, alignItems:"center"}}>
+      {queries.map(q => (
+        <span key={q.id} className="mono" style={{display:"inline-flex", alignItems:"center", gap:5,
+          borderRadius:999, border:"1px solid #D5D9D3", background:"#FAFBF8",
+          padding:"2px 8px", fontSize:11, color:"#5A615C"}}>
+          <span style={{width:6, height:6, borderRadius:999,
+            background: VENUE_COLORS[q.venue] || VENUE_COLORS.all}} />
+          {q.dataset} · {q.venue} · {q.metric}
+          {q.category ? ` · cat:${q.category}` : ""}{q.item_contains ? ` · "${q.item_contains}"` : ""}
+          {q.top ? ` · top ${q.top}` : ""} · {q.from}→{q.to} · by {q.groupBy}
+        </span>
+      ))}
+      {modelUsed && <span className="mono" style={{fontSize:11, color:"#B0B6AF"}}>{modelUsed}</span>}
+    </div>
+  );
+}
+
+const SUGGESTIONS = [
+  "Выручка LF vs Caffellini по месяцам",
+  "Top-10 dishes by revenue in LF last month",
+  "Гости по дэйпартам (завтрак/обед/ужин) в LF",
+  "Menu engineering матрица по LF за последний месяц",
+];
+
+const newChat = () => ({
+  id: String(Date.now()) + Math.random().toString(36).slice(2,6),
+  title: "New chat", messages: [],
+});
+
+/* ================= SETTINGS SCREEN ================= */
+function Settings({ cfg, onSave }) {
+  const [url, setUrl] = useState(cfg.url || "");
+  const [token, setToken] = useState(cfg.token || "");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function test() {
+    setBusy(true); setErr("");
+    try {
+      const cat = await backend({ url: url.trim(), token: token.trim() }, { action: "catalog" });
+      onSave({ url: url.trim(), token: token.trim() }, cat);
+    } catch (e) { setErr("Connection failed: " + e.message); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div style={{minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:16}}>
+      <div style={{width:"100%", maxWidth:440, borderRadius:16, border:"1px solid #E0E2DC",
+        background:"#fff", padding:24}}>
+        <div style={{fontFamily:"Iowan Old Style, Georgia, serif", fontSize:22, fontWeight:600, color:"#1A1D1B"}}>
+          F&amp;B Copilot
+        </div>
+        <div style={{marginTop:4, fontSize:13, color:"#78807B"}}>
+          Connect to the ISD backend (Apps Script Web App).
+        </div>
+        <div style={{marginTop:16}}>
+          <label style={{fontSize:12, color:"#5A615C"}}>Web App URL (…/exec)</label>
+          <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/…/exec"
+            style={{width:"100%", marginTop:4, borderRadius:10, border:"1px solid #D5D9D3",
+              padding:"10px 12px", fontSize:13, outline:"none"}} />
+        </div>
+        <div style={{marginTop:12}}>
+          <label style={{fontSize:12, color:"#5A615C"}}>Access token</label>
+          <input value={token} onChange={e=>setToken(e.target.value)} type="password" placeholder="APP_TOKEN"
+            style={{width:"100%", marginTop:4, borderRadius:10, border:"1px solid #D5D9D3",
+              padding:"10px 12px", fontSize:13, outline:"none"}} />
+        </div>
+        {err && <div style={{marginTop:10, fontSize:12, color:"#A5433A"}}>{err}</div>}
+        <button onClick={test} disabled={busy || !url.trim() || !token.trim()}
+          style={{marginTop:16, width:"100%", borderRadius:10, background:"#1A1D1B", color:"#fff",
+            padding:"10px 0", fontSize:14, fontWeight:500, border:"none",
+            cursor:"pointer", opacity: busy||!url.trim()||!token.trim() ? .5 : 1}}>
+          {busy ? "Connecting…" : "Connect"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ================= APP ================= */
+function App() {
+  const [cfg, setCfg] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(LS_CFG)) || {}; } catch { return {}; }
+  });
+  const [catalog, setCatalog] = useState(null);
+  const [chats, setChats] = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem(LS_CHATS)); return s && s.length ? s : [newChat()]; }
+    catch { return [newChat()]; }
+  });
+  const [activeId, setActiveId] = useState(null);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState("");
+  const [model, setModel] = useState(MODELS[0].id);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const bottomRef = useRef(null);
+  const active = chats.find(c => c.id === activeId) || chats[0];
+
+  useEffect(() => { // авто-коннект при сохранённом конфиге
+    if (cfg.url && cfg.token && !catalog) {
+      backend(cfg, { action: "catalog" }).then(setCatalog).catch(() => setCfg({}));
+    }
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem(LS_CHATS, JSON.stringify(chats.slice(0, 30))); } catch {}
+  }, [chats]);
+  useEffect(() => { bottomRef.current && bottomRef.current.scrollIntoView({behavior:"smooth"}); },
+    [active && active.messages.length, busy]);
+
+  const updateActive = useCallback(fn => {
+    setChats(cs => cs.map(c => (c.id === (active && active.id) ? fn(c) : c)));
+  }, [active && active.id]);
+
+  async function runQueries(queries) {
+    const results = [];
+    for (const q of queries) {
+      if (q.dataset === "menu_matrix") {
+        const resp = await backend(cfg, { action: "query", query: {
+          dataset: "items", venue: q.venue, from: q.from, to: q.to,
+          groupBy: "item", category: q.category } });
+        results.push({ query: q, matrix: classifyMatrix(resp.rows) });
+      } else {
+        const resp = await backend(cfg, { action: "query", query: {
+          dataset: q.dataset, venue: q.venue, from: q.from, to: q.to,
+          groupBy: q.groupBy, category: q.category, item_contains: q.item_contains,
+          top: q.top, sortBy: ["food_cost_pct","avg_price","avg_per_guest","avg_check"].includes(q.metric) ? "gross" : q.metric } });
+        results.push({ query: q, values: resp.rows.map(r => ({ label: r.label, value: deriveMetric(r, q.metric) }))
+          .concat([]).slice(0) , raw: resp.rows });
+        // top-N по производной метрике — сортировка на клиенте
+        const last = results[results.length-1];
+        if (q.top) { last.values.sort((a,b)=>b.value-a.value); last.values = last.values.slice(0, q.top); }
+      }
+    }
+    return results;
+  }
+
+  async function ask(question) {
+    if (!question.trim() || busy || !active || !catalog) return;
+    const q = question.trim();
+    updateActive(c => ({ ...c,
+      title: c.messages.length === 0 ? q.slice(0,42) + (q.length>42?"…":"") : c.title,
+      messages: [...c.messages, { role: "user", text: q }] }));
+    setInput(""); setBusy(true);
+    const prior = active.messages;
+    try {
+      setStage("Planning query…");
+      const hist = historyBlock(prior);
+      const p1 = await backend(cfg, { action: "chat", model,
+        system: plannerSystem(catalog), user: hist + "Current question: " + q });
+      let plan;
+      try { plan = JSON.parse(p1.text.replace(/```json|```/g,"").trim()); }
+      catch { throw new Error("Planner returned invalid JSON"); }
+      const dsets = ["daily","items","hourly","menu_matrix"];
+      const queries = (plan.queries || []).slice(0,4).map((qq,i) => ({
+        id: qq.id || "q"+(i+1),
+        dataset: dsets.includes(qq.dataset) ? qq.dataset : "daily",
+        metric: qq.dataset === "menu_matrix" ? "matrix" : (qq.metric || "gross"),
+        venue: ["LF","Caffelini","all"].includes(qq.venue) ? qq.venue : "all",
+        from: qq.from && qq.from >= catalog.from ? qq.from : catalog.from,
+        to: qq.to && qq.to <= catalog.to ? qq.to : catalog.to,
+        groupBy: qq.dataset === "menu_matrix" ? "item" : (qq.groupBy || "date"),
+        category: qq.category || undefined,
+        item_contains: qq.item_contains || undefined,
+        top: qq.top ? Math.min(Number(qq.top)||10, 25) : undefined,
+        label: qq.label,
+      }));
+      if (!queries.length) throw new Error("Planner produced no queries");
+
+      setStage("Querying warehouse…");
+      const results = await runQueries(queries);
+
+      setStage("Writing answer…");
+      const p2 = await backend(cfg, { action: "chat", model,
+        system: ANSWER_SYSTEM,
+        user: hist + "Current question: " + q + "\n\nComputed results:\n" +
+          JSON.stringify(results.map(r => r.matrix ? condenseMatrix(r) : condense(r))) });
+      let ans;
+      try { ans = JSON.parse(p2.text.replace(/```json|```/g,"").trim()); }
+      catch { ans = { answer: p2.text, charts: [] }; }
+      ans.answer = fixCurrency(ans.answer);
+      (ans.charts || []).forEach(c => { c.title = fixCurrency(c.title); });
+      const charts = (ans.charts || []).map(c => assembleChart(c, results)).filter(Boolean);
+      results.filter(r => r.matrix && r.matrix.items.length).forEach(r => {
+        charts.push({ type: "matrix",
+          title: r.query.venue + " — Menu Engineering (" + r.query.from + " → " + r.query.to + ")",
+          matrix: r.matrix });
+      });
+
+      updateActive(c => ({ ...c, messages: [...c.messages,
+        { role: "assistant", text: ans.answer, charts, queries, modelUsed: p2.model }] }));
+    } catch (e) {
+      updateActive(c => ({ ...c, messages: [...c.messages,
+        { role: "assistant", text: "Could not complete this request: " + e.message + ". Try rephrasing.",
+          charts: [], queries: [] }] }));
+    } finally { setBusy(false); setStage(""); }
+  }
+
+  if (!catalog) {
+    return <Settings cfg={cfg} onSave={(newCfg, cat) => {
+      localStorage.setItem(LS_CFG, JSON.stringify(newCfg));
+      setCfg(newCfg); setCatalog(cat);
+    }} />;
+  }
+
+  const btn = { borderRadius:10, border:"1px solid #D5D9D3", background:"#fff",
+    padding:"6px 10px", fontSize:13, cursor:"pointer", color:"#4B524E" };
+
+  return (
+    <div style={{display:"flex", minHeight:"100vh"}}>
+      {/* sidebar */}
+      <div style={{position: sidebarOpen ? "fixed" : undefined, zIndex:30, inset: sidebarOpen ? "0 auto 0 0" : undefined,
+        width:256, borderRight:"1px solid #D5D9D3", background:"#fff",
+        display: sidebarOpen || window.innerWidth >= 768 ? "block" : "none"}}>
+        <div style={{display:"flex", alignItems:"center", justifyContent:"space-between",
+          borderBottom:"1px solid #E5E7E1", padding:"12px 16px"}}>
+          <span style={{fontSize:13, fontWeight:600, color:"#3A403C"}}>Chats</span>
+          <button style={{...btn, background:"#1A1D1B", color:"#fff", border:"none"}}
+            onClick={() => { const c = newChat(); setChats(cs=>[c,...cs]); setActiveId(c.id); setSidebarOpen(false); }}>
+            + New
+          </button>
+        </div>
+        <div style={{overflowY:"auto", padding:8, maxHeight:"calc(100vh - 53px)"}}>
+          {chats.map(c => (
+            <div key={c.id} onClick={() => { setActiveId(c.id); setSidebarOpen(false); }}
+              style={{display:"flex", justifyContent:"space-between", alignItems:"center",
+                borderRadius:8, padding:"8px 12px", fontSize:13, cursor:"pointer", marginBottom:4,
+                background: c.id === (active&&active.id) ? "#F0F1ED" : "transparent",
+                color: c.id === (active&&active.id) ? "#1A1D1B" : "#5A615C"}}>
+              <span style={{overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{c.title}</span>
+              <span onClick={e => { e.stopPropagation();
+                setChats(cs => { const left = cs.filter(x=>x.id!==c.id);
+                  const next = left.length ? left : [newChat()];
+                  if (c.id === (active&&active.id)) setActiveId(next[0].id);
+                  return next; }); }}
+                style={{marginLeft:8, color:"#B0B6AF", cursor:"pointer"}}>×</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* main */}
+      <div style={{flex:1, display:"flex", flexDirection:"column", minHeight:"100vh"}}>
+        <div style={{position:"sticky", top:0, zIndex:10, borderBottom:"1px solid #D5D9D3",
+          background:"rgba(255,255,255,.9)", padding:"10px 16px", backdropFilter:"blur(6px)"}}>
+          <div style={{maxWidth:768, margin:"0 auto", display:"flex", alignItems:"center",
+            justifyContent:"space-between", gap:12}}>
+            <div style={{display:"flex", alignItems:"center", gap:8}}>
+              <button style={btn} onClick={()=>setSidebarOpen(s=>!s)}>☰</button>
+              <span style={{fontFamily:"Iowan Old Style, Georgia, serif", fontSize:18, fontWeight:600, color:"#1A1D1B"}}>
+                F&amp;B Copilot
+              </span>
+              <span className="mono" style={{fontSize:11, color:"#9AA19A"}}>
+                {catalog.from} → {catalog.to}
+              </span>
+            </div>
+            <div style={{display:"flex", alignItems:"center", gap:8}}>
+              <select value={model} onChange={e=>setModel(e.target.value)}
+                style={{...btn, padding:"6px 8px", fontSize:12}}>
+                {MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+              </select>
+              <button style={btn} title="Reconnect"
+                onClick={() => { localStorage.removeItem(LS_CFG); setCfg({}); setCatalog(null); }}>⚙</button>
+            </div>
+          </div>
+        </div>
+
+        <div style={{width:"100%", maxWidth:768, margin:"0 auto", flex:1, padding:"24px 16px 150px"}}>
+          {active && active.messages.length === 0 && (
+            <div style={{borderRadius:16, border:"1px solid #E0E2DC", background:"#fff", padding:24}}>
+              <div style={{fontSize:13, color:"#5A615C", lineHeight:1.6}}>
+                Live data: La Famiglia + Caffellini, {catalog.from} → {catalog.to}. Numbers are computed
+                by code from the Syrve warehouse — the model plans and narrates, never calculates.
+                Each answer shows how it was computed. Follow-ups keep context.
+              </div>
+              <div style={{marginTop:16, display:"grid", gap:8, gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))"}}>
+                {SUGGESTIONS.map(s => (
+                  <button key={s} onClick={()=>ask(s)}
+                    style={{...btn, textAlign:"left", padding:"10px 12px", background:"#FAFBF8"}}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {active && active.messages.map((m,i) => m.role === "user" ? (
+            <div key={i} style={{marginTop:20, display:"flex", justifyContent:"flex-end"}}>
+              <div style={{maxWidth:"85%", borderRadius:"16px 16px 4px 16px", background:"#26292B",
+                color:"#F5F5F2", padding:"10px 16px", fontSize:14}}>{m.text}</div>
+            </div>
+          ) : (
+            <div key={i} style={{marginTop:20}}>
+              <div style={{borderRadius:"4px 16px 16px 16px", border:"1px solid #E0E2DC",
+                background:"#fff", padding:"12px 16px"}}>
+                <div style={{whiteSpace:"pre-wrap", fontSize:14, lineHeight:1.6, color:"#2A2E2B"}}>{m.text}</div>
+                {m.charts && m.charts.map((c,j) => <ChartBlock key={j} chart={c} />)}
+                {m.queries && m.queries.length > 0 && <QueryChips queries={m.queries} modelUsed={m.modelUsed} />}
+              </div>
+            </div>
+          ))}
+
+          {busy && (
+            <div style={{marginTop:20, display:"flex", alignItems:"center", gap:8, fontSize:13, color:"#78807B"}}>
+              <span style={{width:8, height:8, borderRadius:999, background:"#78807B",
+                animation:"pulse 1s infinite"}} />
+              {stage}
+            </div>
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        <div style={{position:"fixed", bottom:0, left:0, right:0, borderTop:"1px solid #D5D9D3",
+          background:"rgba(255,255,255,.95)", padding:"12px 16px"}}>
+          <div style={{maxWidth:768, margin:"0 auto", display:"flex", gap:8}}>
+            <input value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") ask(input); }}
+              placeholder="Ask about revenue, guests, items, hours… (EN / RU)"
+              disabled={busy}
+              style={{flex:1, borderRadius:10, border:"1px solid #D5D9D3", padding:"10px 14px",
+                fontSize:14, outline:"none"}} />
+            <button onClick={()=>ask(input)} disabled={busy || !input.trim()}
+              style={{borderRadius:10, background:"#1A1D1B", color:"#fff", padding:"10px 20px",
+                fontSize:14, fontWeight:500, border:"none", cursor:"pointer",
+                opacity: busy||!input.trim() ? .4 : 1}}>
+              Ask
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
