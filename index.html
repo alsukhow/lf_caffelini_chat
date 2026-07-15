@@ -39,7 +39,8 @@ const MATRIX_CLASSES = { Star: "#1E6B4F", Plowhorse: "#C4762A", Puzzle: "#3A6EA5
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const DAYPART_ORDER = ["Breakfast","Lunch","Dinner","Other"];
 
-const APP_VERSION = "v6";
+const APP_VERSION = "v7";
+const TABLES = { LF: 31 }; // посадочных столов; Caffellini — grab&go, метрика не применима
 const DAILY_METRICS = ["gross","net","checks","guests","avg_per_guest","avg_check"];
 const ITEM_METRICS = ["gross","net","qty","cost","food_cost_pct","avg_price"];
 const HOURLY_METRICS = ["gross","net","qty","checks","guests","avg_per_guest"];
@@ -107,6 +108,7 @@ DATASETS:
 2. "items" — menu-item sales per DAY (item, category, group). Metrics: ${ITEM_METRICS.join(", ")} (food_cost_pct in %, avg_price = gross/qty). groupBy: item|category|group|date|month|weekday|venue|none. Filters: "category" (matches category or group name), "item_contains". Optional "top": N. NOTE: items has NO hour dimension — for any hour breakdown use "hourly".
 3. "hourly" — sales by hour of day, with menu group dimension. Metrics: ${HOURLY_METRICS.join(", ")}. groupBy: hour|daypart|group|date|month|weekday|venue|none. Optional filter "category" (matches menu group, e.g. pizza, pinsa, pasta). Dayparts: ${cat.dayparts.map(d=>d.name+" "+d.from+"-"+d.to).join(", ")}. IMPORTANT: when "category" filter is used, only gross and qty are valid metrics (guests/checks would double-count across groups).
 4. "menu_matrix" — Kasavana-Smith menu engineering (Star/Plowhorse/Puzzle/Dog). Use for menu engineering / promote-remove-reprice questions. Fields: venue (single venue preferred), from, to, optional category. Max ONE per turn.
+5. "table_turnover" — seatings per table per day (checks / 31 tables). LF ONLY: Caffellini is a grab-and-go cafe, the metric is not applicable there (if asked about Caffellini turnover, still plan LF or nothing, the analyst will explain). metric: "turnover". groupBy: date|weekday|month|daypart|none.
 Amounts are AED. Net = gross after VAT & fees. Use prior conversation to resolve references like "the same but for Caffellini".
 Respond ONLY with JSON, no prose, no markdown:
 {"queries":[{"id":"q1","dataset":"daily"|"items"|"hourly"|"menu_matrix","metric":"...","venue":"LF"|"Caffelini"|"all","from":"YYYY-MM-DD","to":"YYYY-MM-DD","groupBy":"...","category":"opt","item_contains":"opt","top":10,"label":"short series name"}]}
@@ -114,6 +116,7 @@ Rules: to compare venues over time, one query per venue (same groupBy). If the q
 }
 
 const ANSWER_SYSTEM = `You are a sharp F&B financial analyst writing for a CFO. You receive a user question, optional prior conversation, and PRE-COMPUTED query results (computed by code — trust these numbers exactly, never recalculate, never second-guess or invent numbers). Each result is labeled with its query (dataset, metric, venue, period) — the values ARE that metric.
+If results include metric "turnover": it is table turnover = checks / 31 tables (LF), in seatings per table per day; note that split bills slightly inflate it. Turnover is not applicable to Caffellini (grab-and-go) — say so briefly if the user asked about it.
 CURRENCY RULE (critical): ALL monetary values are UAE dirhams. NEVER use "$", "USD" or "dollars". Write amounts as "3.56M AED", "604.6K AED", "1,778 AED". Non-monetary metrics (guests, checks, qty) have no currency.
 OUTPUT FORMAT (critical): your ENTIRE output must be a single JSON object. Start with "{" and end with "}". No preamble, no reasoning, no markdown, nothing outside the JSON. Inside the "answer" string NEVER use unescaped double quotes — for names/titles use «guillemets» or single quotes (e.g. «Cervaro della Sala»).
 {"answer":"2-6 sentences, plain text, in the same language as the user question, cite the key numbers, be direct and note anything unusual","charts":[{"title":"...","type":"line"|"bar"|"area","queryIds":["q1"]}]}
@@ -220,6 +223,7 @@ function condenseMatrix(res) {
 
 /* ================= CHART ASSEMBLY ================= */
 const metricUnit = m => m === "food_cost_pct" ? "%"
+  : m === "turnover" ? "turns/day"
   : ["gross","net","avg_per_guest","avg_check","cost","avg_price"].includes(m) ? "AED" : "";
 const SERIES_PALETTE = ["#1E6B4F","#C4762A","#3A6EA5","#A5433A"];
 
@@ -527,8 +531,44 @@ function App() {
     setChats(cs => cs.map(c => (c.id === (active && active.id) ? fn(c) : c)));
   }, [active && active.id]);
 
+  function eachDate(from, to, fn) {
+    const d = new Date(from + "T00:00:00"), end = new Date(to + "T00:00:00");
+    while (d <= end) { fn(d.toISOString().slice(0,10), d); d.setDate(d.getDate()+1); }
+  }
+  function calendarDays(from, to) { let n = 0; eachDate(from, to, () => n++); return Math.max(1, n); }
+
+  async function runTurnover(q) {
+    const tables = TABLES[q.venue] || TABLES.LF;
+    if (q.groupBy === "daypart") {
+      const resp = await backend(cfg, { action: "query", query: {
+        dataset: "hourly", venue: "LF", from: q.from, to: q.to, groupBy: "daypart" } });
+      const days = calendarDays(q.from, q.to);
+      return { query: q, values: resp.rows.map(r => ({
+        label: r.label, value: r2(r.checks / days / tables) })) };
+    }
+    const resp = await backend(cfg, { action: "query", query: {
+      dataset: "daily", venue: "LF", from: q.from, to: q.to, groupBy: "date" } });
+    const byDate = {}; resp.rows.forEach(r => { byDate[r.label] = r.checks; });
+    if (q.groupBy === "date") {
+      return { query: q, values: resp.rows.map(r => ({
+        label: r.label, value: r2(r.checks / tables) })) };
+    }
+    // weekday / month / none: средний дневной turnover по бакетам календаря
+    const sums = {}, days = {};
+    eachDate(q.from, q.to, (iso, d) => {
+      let key = "total";
+      if (q.groupBy === "weekday") key = WEEKDAYS[(d.getDay()+6)%7];
+      if (q.groupBy === "month") key = iso.slice(0,7);
+      sums[key] = (sums[key]||0) + (byDate[iso]||0);
+      days[key] = (days[key]||0) + 1;
+    });
+    return { query: q, values: Object.keys(sums).map(k => ({
+      label: k, value: r2(sums[k] / days[k] / tables) })) };
+  }
+
   async function runQueries(queries) {
     return Promise.all(queries.map(async q => {
+      if (q.dataset === "table_turnover") return runTurnover(q);
       if (q.dataset === "menu_matrix") {
         const resp = await backend(cfg, { action: "query", query: {
           dataset: "items", venue: q.venue, from: q.from, to: q.to,
@@ -560,17 +600,21 @@ function App() {
         system: plannerSystem(catalog), user: hist + "Current question: " + q });
       const plan = extractJson(p1.text);
       if (!plan) throw new Error("Planner returned invalid JSON");
-      const dsets = ["daily","items","hourly","menu_matrix"];
+      const dsets = ["daily","items","hourly","menu_matrix","table_turnover"];
       const queries = (plan.queries || []).slice(0,4).map((qq,i) => {
         const dataset = dsets.includes(qq.dataset) ? qq.dataset : "daily";
         return {
           id: qq.id || "q"+(i+1),
           dataset,
-          metric: dataset === "menu_matrix" ? "matrix" : normalizeMetric(qq.metric, dataset),
-          venue: ["LF","Caffelini","all"].includes(qq.venue) ? qq.venue : "all",
+          metric: dataset === "menu_matrix" ? "matrix"
+            : dataset === "table_turnover" ? "turnover" : normalizeMetric(qq.metric, dataset),
+          venue: dataset === "table_turnover" ? "LF"
+            : ["LF","Caffelini","all"].includes(qq.venue) ? qq.venue : "all",
           from: qq.from && qq.from >= catalog.from ? qq.from : catalog.from,
           to: qq.to && qq.to <= catalog.to ? qq.to : catalog.to,
-          groupBy: dataset === "menu_matrix" ? "item" : (qq.groupBy || "date"),
+          groupBy: dataset === "menu_matrix" ? "item"
+            : dataset === "table_turnover" ? (["date","weekday","month","daypart","none"].includes(qq.groupBy) ? qq.groupBy : "date")
+            : (qq.groupBy || "date"),
           category: qq.category || undefined,
           item_contains: qq.item_contains || undefined,
           top: qq.top ? Math.min(Number(qq.top)||10, 25) : undefined,
